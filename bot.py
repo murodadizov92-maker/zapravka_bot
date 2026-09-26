@@ -224,7 +224,7 @@ async def cmd_hisobot(message: Message):
 @dp.message(Command("groupid"))
 async def cmd_groupid(message: Message):
     if message.chat.type in ("group", "supergroup"):
-        await message.answer(f"Bu guruhning chat_id'si: `{message.chat.id}`", parse_mode="Markdown")
+        await message.answer(f"Bu guruhning ID raqami: {message.chat.id}")
 
 
 @dp.callback_query(F.data.startswith("rep_today:"))
