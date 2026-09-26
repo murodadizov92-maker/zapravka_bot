@@ -18,12 +18,21 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 # ---------------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
 
-# O'zingizning (admin/egasining) Telegram user_id'lari.
-# Bu ID'lardan kelgan xabarlar (masalan chek rasmlari) "xodim so'ragan summa"
-# sifatida hisoblanmaydi, faqat log qilinadi.
+# O'zingizning (admin/egasining) Telegram user_id'lari — vergul bilan ajratib
+# Render'ning Environment bo'limida ADMIN_IDS o'zgaruvchisiga yozing,
+# masalan: 123456789,987654321
+# Bu ID'lardan kelgan xabarlar "xodim so'ragan summa" sifatida hisoblanmaydi,
+# va faqat shu ID'lar /hisobot buyrug'ini ishlata oladi.
 ADMIN_IDS = {
-    # 123456789,  # <-- shu yerga o'z Telegram ID'ingizni yozing
+    int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
+
+# Gaz-zapravka guruhingizning chat_id'si. Bot guruhga qo'shilgandan keyin
+# guruhda "/groupid" deb yozib shu qiymatni olasiz, so'ng Render'ning
+# Environment bo'limiga GROUP_CHAT_ID nomi bilan qo'ying. Shundan keyin
+# botga shaxsiy (DM) yozib ham shu guruhning hisobotini ko'ra olasiz.
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
+GROUP_CHAT_ID = int(GROUP_CHAT_ID) if GROUP_CHAT_ID and GROUP_CHAT_ID.lstrip("-").isdigit() else None
 
 DB_PATH = os.getenv("GAZ_BOT_DB", "gaz_rasxod.db")
 
@@ -160,15 +169,15 @@ class ReportStates(StatesGroup):
     waiting_end_date = State()
 
 
-def report_keyboard() -> InlineKeyboardMarkup:
+def report_keyboard(target_chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="Bugun", callback_data="rep_today"),
-            InlineKeyboardButton(text="Kecha", callback_data="rep_yesterday"),
+            InlineKeyboardButton(text="Bugun", callback_data=f"rep_today:{target_chat_id}"),
+            InlineKeyboardButton(text="Kecha", callback_data=f"rep_yesterday:{target_chat_id}"),
         ],
         [
-            InlineKeyboardButton(text="Bu oy", callback_data="rep_month"),
-            InlineKeyboardButton(text="Sana oralig'i", callback_data="rep_range"),
+            InlineKeyboardButton(text="Bu oy", callback_data=f"rep_month:{target_chat_id}"),
+            InlineKeyboardButton(text="Sana oralig'i", callback_data=f"rep_range:{target_chat_id}"),
         ],
     ])
 
@@ -191,39 +200,67 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("hisobot"))
 async def cmd_hisobot(message: Message):
-    await message.answer("Qaysi davr uchun hisobot kerak?", reply_markup=report_keyboard())
+    user_id = message.from_user.id
+
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        # Admin bo'lmagan xodimlar hisobotni ko'ra olmaydi
+        return
+
+    if message.chat.type == "private":
+        if GROUP_CHAT_ID is None:
+            await message.answer(
+                "GROUP_CHAT_ID hali sozlanmagan. Avval guruhda \"/groupid\" "
+                "deb yozib chat_id'ni oling, so'ng uni Render'ning "
+                "Environment bo'limiga GROUP_CHAT_ID nomi bilan qo'shing."
+            )
+            return
+        target_chat_id = GROUP_CHAT_ID
+    else:
+        target_chat_id = message.chat.id
+
+    await message.answer("Qaysi davr uchun hisobot kerak?", reply_markup=report_keyboard(target_chat_id))
 
 
-@dp.callback_query(F.data == "rep_today")
+@dp.message(Command("groupid"))
+async def cmd_groupid(message: Message):
+    if message.chat.type in ("group", "supergroup"):
+        await message.answer(f"Bu guruhning chat_id'si: `{message.chat.id}`", parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("rep_today:"))
 async def rep_today(call: CallbackQuery):
+    target_chat_id = int(call.data.split(":", 1)[1])
     today = date.today()
-    rows = await fetch_report(call.message.chat.id, today, today)
+    rows = await fetch_report(target_chat_id, today, today)
     await call.message.edit_text(format_report(f"Hisobot: bugun ({today:%d.%m.%Y})", rows))
     await call.answer()
 
 
-@dp.callback_query(F.data == "rep_yesterday")
+@dp.callback_query(F.data.startswith("rep_yesterday:"))
 async def rep_yesterday(call: CallbackQuery):
+    target_chat_id = int(call.data.split(":", 1)[1])
     y = date.today() - timedelta(days=1)
-    rows = await fetch_report(call.message.chat.id, y, y)
+    rows = await fetch_report(target_chat_id, y, y)
     await call.message.edit_text(format_report(f"Hisobot: kecha ({y:%d.%m.%Y})", rows))
     await call.answer()
 
 
-@dp.callback_query(F.data == "rep_month")
+@dp.callback_query(F.data.startswith("rep_month:"))
 async def rep_month(call: CallbackQuery):
+    target_chat_id = int(call.data.split(":", 1)[1])
     today = date.today()
     start = today.replace(day=1)
-    rows = await fetch_report(call.message.chat.id, start, today)
+    rows = await fetch_report(target_chat_id, start, today)
     title = f"Hisobot: bu oy ({start:%d.%m.%Y} - {today:%d.%m.%Y})"
     await call.message.edit_text(format_report(title, rows))
     await call.answer()
 
 
-@dp.callback_query(F.data == "rep_range")
+@dp.callback_query(F.data.startswith("rep_range:"))
 async def rep_range(call: CallbackQuery, state: FSMContext):
+    target_chat_id = int(call.data.split(":", 1)[1])
     await state.set_state(ReportStates.waiting_start_date)
-    await state.update_data(chat_id=call.message.chat.id)
+    await state.update_data(chat_id=target_chat_id)
     await call.message.answer("Boshlanish sanasini kiriting (masalan: 01.09.2026)")
     await call.answer()
 
