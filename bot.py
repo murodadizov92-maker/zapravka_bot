@@ -204,6 +204,9 @@ def report_keyboard(target_chat_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="Bu oy", callback_data=f"rep_month:{target_chat_id}"),
             InlineKeyboardButton(text="Sana oralig'i", callback_data=f"rep_range:{target_chat_id}"),
         ],
+        [
+            InlineKeyboardButton(text="🗑 Yozuvni o'chirish", callback_data=f"rep_delete:{target_chat_id}"),
+        ],
     ])
 
 
@@ -338,6 +341,20 @@ async def rep_month(call: CallbackQuery):
     rows = await fetch_report(target_chat_id, start, today)
     title = f"Hisobot: bu oy ({start:%d.%m.%Y} - {today:%d.%m.%Y})"
     await call.message.edit_text(format_report(title, rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("rep_delete:"))
+async def rep_delete(call: CallbackQuery):
+    target_chat_id = int(call.data.split(":", 1)[1])
+    rows = await fetch_recent(target_chat_id)
+    if not rows:
+        await call.message.edit_text("Hozircha yozuvlar yo'q.")
+    else:
+        await call.message.edit_text(
+            "Oxirgi yozuvlar. O'chirish uchun kerakli qatorni bosing:",
+            reply_markup=recent_keyboard(target_chat_id, rows),
+        )
     await call.answer()
 
 
