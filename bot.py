@@ -129,6 +129,31 @@ async def save_request(chat_id: int, user_id: int, full_name: str,
         await db.commit()
 
 
+async def fetch_recent(chat_id: int, limit: int = 15) -> list[tuple]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT id, full_name, amount, raw_text, created_at
+            FROM requests
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (chat_id, limit),
+        )
+        return await cursor.fetchall()
+
+
+async def delete_request(record_id: int, chat_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM requests WHERE id = ? AND chat_id = ?",
+            (record_id, chat_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
 async def fetch_report(chat_id: int, start: date, end: date) -> list[tuple]:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
@@ -225,6 +250,66 @@ async def cmd_hisobot(message: Message):
 async def cmd_groupid(message: Message):
     if message.chat.type in ("group", "supergroup"):
         await message.answer(f"Bu guruhning ID raqami: {message.chat.id}")
+
+
+def recent_keyboard(target_chat_id: int, rows: list[tuple]) -> InlineKeyboardMarkup:
+    buttons = []
+    for record_id, full_name, amount, raw_text, created_at in rows:
+        ts = created_at[11:16] if len(created_at) > 16 else created_at
+        label = f"🗑 {ts} {full_name} — {amount:,} so'm".replace(",", " ")
+        buttons.append([InlineKeyboardButton(
+            text=label, callback_data=f"del:{record_id}:{target_chat_id}"
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.message(Command("oxirgilar"))
+async def cmd_oxirgilar(message: Message):
+    user_id = message.from_user.id
+    if ADMIN_IDS and user_id not in ADMIN_IDS:
+        return
+
+    if message.chat.type == "private":
+        if GROUP_CHAT_ID is None:
+            await message.answer(
+                "GROUP_CHAT_ID hali sozlanmagan. Avval guruhda \"/groupid\" "
+                "deb yozib chat_id'ni oling, so'ng uni Render'ning "
+                "Environment bo'limiga GROUP_CHAT_ID nomi bilan qo'shing."
+            )
+            return
+        target_chat_id = GROUP_CHAT_ID
+    else:
+        target_chat_id = message.chat.id
+
+    rows = await fetch_recent(target_chat_id)
+    if not rows:
+        await message.answer("Hozircha yozuvlar yo'q.")
+        return
+
+    await message.answer(
+        "Oxirgi yozuvlar. O'chirish uchun kerakli qatorni bosing:",
+        reply_markup=recent_keyboard(target_chat_id, rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("del:"))
+async def cb_delete(call: CallbackQuery):
+    if ADMIN_IDS and call.from_user.id not in ADMIN_IDS:
+        await call.answer("Ruxsat yo'q", show_alert=True)
+        return
+
+    _, record_id, target_chat_id = call.data.split(":")
+    ok = await delete_request(int(record_id), int(target_chat_id))
+
+    rows = await fetch_recent(int(target_chat_id))
+    if not rows:
+        await call.message.edit_text("Hozircha yozuvlar yo'q.")
+    else:
+        await call.message.edit_text(
+            "Oxirgi yozuvlar. O'chirish uchun kerakli qatorni bosing:",
+            reply_markup=recent_keyboard(int(target_chat_id), rows),
+        )
+    await call.answer("O'chirildi ✅" if ok else "Topilmadi")
 
 
 @dp.callback_query(F.data.startswith("rep_today:"))
