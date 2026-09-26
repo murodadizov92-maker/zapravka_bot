@@ -1,0 +1,19 @@
+[Unit]
+Description=Gaz rasxod Telegram bot
+After=network.target
+
+[Service]
+# O'z serveringizdagi haqiqiy foydalanuvchi va papka yo'lini yozing
+User=root
+WorkingDirectory=/root/gaz-bot
+ExecStart=/root/gaz-bot/venv/bin/python bot.py
+Environment=GAZ_BOT_TOKEN=PUT_YOUR_TOKEN_HERE
+
+# Bot biror sababga ko'ra to'xtab qolsa, avtomatik qayta ishga tushadi.
+# Shu bilan "har 5 daqiqada tebratish" kerak bo'lmaydi — bot doim,
+# uzluksiz (polling rejimida) ishlab turadi, faqat xatolik bo'lganda qayta tiklanadi.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
