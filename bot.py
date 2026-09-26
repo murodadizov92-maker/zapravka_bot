@@ -15,12 +15,12 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 # ---------------------------------------------------------------------------
 # SOZLAMALAR
 # ---------------------------------------------------------------------------
-BOT_TOKEN = os.getenv("GAZ_BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
+BOT_TOKEN = os.getenv("8712488671:AAEsTey07vhLHRAmLhb5HfI6AYiLL-8l5Kw", "PUT_YOUR_TOKEN_HERE")
 
 # O'zingizning (admin/egasining) Telegram user_id'lari.
 # Bu ID'lardan kelgan xabarlar (masalan chek rasmlari) "xodim so'ragan summa"
 # sifatida hisoblanmaydi, faqat log qilinadi.
-ADMIN_IDS = {
+ADMIN_IDS = {7553654583
     # 123456789,  # <-- shu yerga o'z Telegram ID'ingizni yozing
 }
 
