@@ -5,6 +5,7 @@ import re
 from datetime import datetime, date, timedelta
 
 import aiosqlite
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -15,12 +16,12 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 # ---------------------------------------------------------------------------
 # SOZLAMALAR
 # ---------------------------------------------------------------------------
-BOT_TOKEN = os.getenv("8712488671:AAEsTey07vhLHRAmLhb5HfI6AYiLL-8l5Kw", "PUT_YOUR_TOKEN_HERE")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
 
 # O'zingizning (admin/egasining) Telegram user_id'lari.
 # Bu ID'lardan kelgan xabarlar (masalan chek rasmlari) "xodim so'ragan summa"
 # sifatida hisoblanmaydi, faqat log qilinadi.
-ADMIN_IDS = {7553654583
+ADMIN_IDS = {
     # 123456789,  # <-- shu yerga o'z Telegram ID'ingizni yozing
 }
 
@@ -281,8 +282,33 @@ async def catch_group_message(message: Message):
     log.info("Saqlandi: %s -> %s so'm (%s)", full_name, amount, message.text)
 
 
+async def health(request):
+    return web.Response(text="Bot ishlayapti")
+
+
+async def start_web_server():
+    """Render.com (va shunga o'xshash) 'Web Service' talab qiladigan
+    portni tinglaydigan minimal server. Botning asosiy ishiga (Telegram
+    polling) hech qanday aloqasi yo'q — faqat 'xizmat tirik' deb
+    ko'rsatish uchun kerak."""
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info("Health-check server %s portda ishga tushdi", port)
+
+
 async def main():
+    if not BOT_TOKEN or BOT_TOKEN == "PUT_YOUR_TOKEN_HERE":
+        raise RuntimeError(
+            "BOT_TOKEN muhit o'zgaruvchisi topilmadi yoki bo'sh. "
+            "Render'dagi Environment bo'limida BOT_TOKEN qiymatini tekshiring."
+        )
     await init_db()
+    await start_web_server()
     log.info("Bot ishga tushdi (polling rejimida)")
     await dp.start_polling(bot)
 
