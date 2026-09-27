@@ -11,7 +11,10 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton,
+)
 
 # ---------------------------------------------------------------------------
 # SOZLAMALAR
@@ -185,7 +188,7 @@ async def fetch_receipts(chat_id: int, user_id: int | None = None,
         params.extend([start.isoformat(), end.isoformat()])
 
     query = (
-        "SELECT full_name, has_photo, caption, created_at FROM receipts "
+        "SELECT full_name, has_photo, caption, created_at, file_id FROM receipts "
         f"WHERE {' AND '.join(conditions)} ORDER BY created_at ASC"
     )
 
@@ -272,13 +275,13 @@ def format_receipts(title: str, rows: list[tuple]) -> str:
         return f"🧾 {title}\n\nHozircha cheklar/izohlar yo'q."
 
     lines = [f"🧾 {title}", ""]
-    for full_name, has_photo, caption, created_at in rows:
+    for full_name, has_photo, caption, created_at, file_id in rows:
         try:
             dt = datetime.fromisoformat(created_at)
             ts = dt.strftime("%d.%m.%Y %H:%M")
         except ValueError:
             ts = created_at
-        piece = "📷 chek rasmi" if has_photo else "📝 izoh"
+        piece = "📷 chek rasmi (pastda)" if has_photo else "📝 izoh"
         if caption:
             piece += f": {caption}"
         lines.append(f"{ts} — {full_name} — {piece}")
@@ -341,17 +344,24 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
+main_menu_keyboard = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="📊 Hisobot")]],
+    resize_keyboard=True,
+)
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
         "Salom! Men gaz-zapravka rasxodlarini kuzatuvchi botman.\n\n"
         "Guruhga qo'shilganimdan keyin xodimlar yozgan summalarni avtomatik "
-        "saqlab boraman. Hisobotni ko'rish uchun /hisobot buyrug'ini yuboring."
+        "saqlab boraman. Hisobotni ko'rish uchun pastdagi \"📊 Hisobot\" "
+        "tugmasini bosing (yoki /hisobot deb yozing).",
+        reply_markup=main_menu_keyboard,
     )
 
 
-@dp.message(Command("hisobot"))
-async def cmd_hisobot(message: Message):
+async def show_hisobot_menu(message: Message):
     user_id = message.from_user.id
 
     if ADMIN_IDS and user_id not in ADMIN_IDS:
@@ -371,6 +381,16 @@ async def cmd_hisobot(message: Message):
         target_chat_id = message.chat.id
 
     await message.answer("Qaysi davr uchun hisobot kerak?", reply_markup=report_keyboard(target_chat_id))
+
+
+@dp.message(Command("hisobot"))
+async def cmd_hisobot(message: Message):
+    await show_hisobot_menu(message)
+
+
+@dp.message(F.text == "📊 Hisobot")
+async def btn_hisobot(message: Message):
+    await show_hisobot_menu(message)
 
 
 @dp.message(Command("groupid"))
@@ -623,6 +643,19 @@ async def recvpick(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await state.clear()
 
+    # Rasmi bor yozuvlarni haqiqiy rasm sifatida, izohi bilan yuboramiz
+    for full_name, has_photo, caption, created_at, file_id in rows:
+        if has_photo and file_id:
+            try:
+                dt = datetime.fromisoformat(created_at)
+                ts = dt.strftime("%d.%m.%Y %H:%M")
+            except ValueError:
+                ts = created_at
+            cap = f"{ts} — {full_name}"
+            if caption:
+                cap += f"\n{caption}"
+            await call.message.answer_photo(file_id, caption=cap)
+
 
 @dp.callback_query(F.data.startswith("rep_range:"))
 async def rep_range(call: CallbackQuery, state: FSMContext):
@@ -659,6 +692,26 @@ async def got_end_date(message: Message, state: FSMContext):
     title = f"Hisobot: {start:%d.%m.%Y} - {end:%d.%m.%Y}"
     await message.answer(format_report(title, rows))
     await state.clear()
+
+
+@dp.message(
+    F.chat.type.in_({"group", "supergroup"})
+    & F.reply_to_message
+    & F.from_user.id.in_(ADMIN_IDS)
+)
+async def admin_payment_reply(message: Message):
+    """Admin guruhda kimningdir xabariga javob (reply) qilib to'lov/chek
+    yuborsa, bot o'sha xodimni belgilab chek so'raydi."""
+    replied_user = message.reply_to_message.from_user
+    if replied_user is None or replied_user.id in ADMIN_IDS or replied_user.is_bot:
+        return  # o'ziga-o'zi yoki botga javob bo'lsa e'tiborsiz
+
+    mention = f'<a href="tg://user?id={replied_user.id}">{replied_user.full_name}</a>'
+    await message.answer(
+        f"🔔 {mention}, to'lovingiz amalga oshirildi. "
+        f"Iltimos, chek rasmini yoki tasdiqni shu yerga yuboring.",
+        parse_mode="HTML",
+    )
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
