@@ -110,7 +110,88 @@ async def init_db():
             )
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                full_name TEXT NOT NULL,
+                username TEXT,
+                has_photo INTEGER NOT NULL DEFAULT 0,
+                file_id TEXT,
+                caption TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         await db.commit()
+
+
+async def save_receipt(chat_id: int, user_id: int, full_name: str,
+                        username: str | None, has_photo: bool,
+                        file_id: str | None, caption: str | None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO receipts (chat_id, user_id, full_name, username,
+                                   has_photo, file_id, caption, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (chat_id, user_id, full_name, username, int(has_photo),
+             file_id, caption, datetime.now().isoformat()),
+        )
+        await db.commit()
+
+
+async def fetch_receipt_users(chat_id: int, start: date | None = None,
+                               end: date | None = None) -> list[tuple]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        if start is None:
+            cursor = await db.execute(
+                """
+                SELECT DISTINCT user_id, full_name
+                FROM receipts
+                WHERE chat_id = ?
+                ORDER BY full_name
+                """,
+                (chat_id,),
+            )
+        else:
+            cursor = await db.execute(
+                """
+                SELECT DISTINCT user_id, full_name
+                FROM receipts
+                WHERE chat_id = ? AND date(created_at) BETWEEN date(?) AND date(?)
+                ORDER BY full_name
+                """,
+                (chat_id, start.isoformat(), end.isoformat()),
+            )
+        return await cursor.fetchall()
+
+
+async def fetch_receipts(chat_id: int, user_id: int | None = None,
+                          start: date | None = None,
+                          end: date | None = None) -> list[tuple]:
+    conditions = ["chat_id = ?"]
+    params: list = [chat_id]
+
+    if user_id is not None:
+        conditions.append("user_id = ?")
+        params.append(user_id)
+
+    if start is not None:
+        conditions.append("date(created_at) BETWEEN date(?) AND date(?)")
+        params.extend([start.isoformat(), end.isoformat()])
+
+    query = (
+        "SELECT full_name, has_photo, caption, created_at FROM receipts "
+        f"WHERE {' AND '.join(conditions)} ORDER BY created_at ASC"
+    )
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(query, params)
+        return await cursor.fetchall()
 
 
 async def save_request(chat_id: int, user_id: int, full_name: str,
@@ -186,12 +267,52 @@ def format_report(title: str, rows: list[tuple]) -> str:
     return "\n".join(lines)
 
 
+def format_receipts(title: str, rows: list[tuple]) -> str:
+    if not rows:
+        return f"🧾 {title}\n\nHozircha cheklar/izohlar yo'q."
+
+    lines = [f"🧾 {title}", ""]
+    for full_name, has_photo, caption, created_at in rows:
+        try:
+            dt = datetime.fromisoformat(created_at)
+            ts = dt.strftime("%d.%m.%Y %H:%M")
+        except ValueError:
+            ts = created_at
+        piece = "📷 chek rasmi" if has_photo else "📝 izoh"
+        if caption:
+            piece += f": {caption}"
+        lines.append(f"{ts} — {full_name} — {piece}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # FSM (sana oralig'ini so'rash uchun)
 # ---------------------------------------------------------------------------
 class ReportStates(StatesGroup):
     waiting_start_date = State()
     waiting_end_date = State()
+
+
+class ReceiptStates(StatesGroup):
+    waiting_start_date = State()
+    waiting_end_date = State()
+    picking_user = State()
+
+
+def receipt_period_keyboard(target_chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Bugun", callback_data=f"recvp:today:{target_chat_id}"),
+            InlineKeyboardButton(text="Kecha", callback_data=f"recvp:yday:{target_chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="Bu oy", callback_data=f"recvp:month:{target_chat_id}"),
+            InlineKeyboardButton(text="Hammasi (vaqt)", callback_data=f"recvp:all:{target_chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="Sana oralig'i", callback_data=f"recvp:range:{target_chat_id}"),
+        ],
+    ])
 
 
 def report_keyboard(target_chat_id: int) -> InlineKeyboardMarkup:
@@ -206,6 +327,9 @@ def report_keyboard(target_chat_id: int) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="🗑 Yozuvni o'chirish", callback_data=f"rep_delete:{target_chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="🧾 Cheklar", callback_data=f"rep_receipts:{target_chat_id}"),
         ],
     ])
 
@@ -358,6 +482,148 @@ async def rep_delete(call: CallbackQuery):
     await call.answer()
 
 
+@dp.callback_query(F.data.startswith("rep_receipts:"))
+async def rep_receipts(call: CallbackQuery):
+    target_chat_id = int(call.data.split(":", 1)[1])
+    await call.message.edit_text(
+        "Cheklarni qaysi davr uchun ko'rmoqchisiz?",
+        reply_markup=receipt_period_keyboard(target_chat_id),
+    )
+    await call.answer()
+
+
+async def _show_receipt_users(message: Message, state: FSMContext,
+                               target_chat_id: int, start: date | None,
+                               end: date | None, title: str):
+    users = await fetch_receipt_users(target_chat_id, start, end)
+
+    if not users:
+        await message.edit_text(f"🧾 {title}\n\nBu davrda cheklar/izohlar yo'q.")
+        await state.clear()
+        return
+
+    # Callback_data uzunligi cheklangani uchun user_id'larni FSM holatida
+    # saqlaymiz, tugmada esa faqat qisqa index ishlatiladi.
+    user_map = {str(i): user_id for i, (user_id, _) in enumerate(users)}
+    await state.update_data(
+        chat_id=target_chat_id,
+        start=start.isoformat() if start else None,
+        end=end.isoformat() if end else None,
+        title=title,
+        user_map=user_map,
+    )
+    await state.set_state(ReceiptStates.picking_user)
+
+    buttons = [
+        [InlineKeyboardButton(text=full_name, callback_data=f"recvpick:{i}")]
+        for i, (user_id, full_name) in enumerate(users)
+    ]
+    buttons.append([InlineKeyboardButton(text="👥 Hammasi", callback_data="recvpick:all")])
+
+    await message.edit_text(
+        f"🧾 {title}\n\nKimning cheklarini ko'rmoqchisiz?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@dp.callback_query(F.data.startswith("recvp:"))
+async def recvp_period(call: CallbackQuery, state: FSMContext):
+    _, period, target_chat_id = call.data.split(":")
+    target_chat_id = int(target_chat_id)
+    today = date.today()
+
+    if period == "today":
+        await _show_receipt_users(call.message, state, target_chat_id, today, today,
+                                   f"Cheklar: bugun ({today:%d.%m.%Y})")
+    elif period == "yday":
+        y = today - timedelta(days=1)
+        await _show_receipt_users(call.message, state, target_chat_id, y, y,
+                                   f"Cheklar: kecha ({y:%d.%m.%Y})")
+    elif period == "month":
+        start = today.replace(day=1)
+        await _show_receipt_users(call.message, state, target_chat_id, start, today,
+                                   f"Cheklar: bu oy ({start:%d.%m.%Y} - {today:%d.%m.%Y})")
+    elif period == "all":
+        await _show_receipt_users(call.message, state, target_chat_id, None, None,
+                                   "Cheklar: hammasi (vaqt)")
+    elif period == "range":
+        await state.set_state(ReceiptStates.waiting_start_date)
+        await state.update_data(chat_id=target_chat_id)
+        await call.message.answer("Boshlanish sanasini kiriting (masalan: 01.09.2026)")
+
+    await call.answer()
+
+
+@dp.message(ReceiptStates.waiting_start_date)
+async def receipt_got_start_date(message: Message, state: FSMContext):
+    try:
+        start = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer("Sana formati noto'g'ri. Masalan: 01.09.2026 deb yozing.")
+        return
+    await state.update_data(range_start=start.isoformat())
+    await state.set_state(ReceiptStates.waiting_end_date)
+    await message.answer("Endi tugash sanasini kiriting (masalan: 26.09.2026)")
+
+
+@dp.message(ReceiptStates.waiting_end_date)
+async def receipt_got_end_date(message: Message, state: FSMContext):
+    try:
+        end = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer("Sana formati noto'g'ri. Masalan: 26.09.2026 deb yozing.")
+        return
+    data = await state.get_data()
+    start = date.fromisoformat(data["range_start"])
+    target_chat_id = data["chat_id"]
+    title = f"Cheklar: {start:%d.%m.%Y} - {end:%d.%m.%Y}"
+
+    users = await fetch_receipt_users(target_chat_id, start, end)
+    if not users:
+        await message.answer(f"🧾 {title}\n\nBu davrda cheklar/izohlar yo'q.")
+        await state.clear()
+        return
+
+    user_map = {str(i): user_id for i, (user_id, _) in enumerate(users)}
+    await state.update_data(start=start.isoformat(), end=end.isoformat(),
+                             title=title, user_map=user_map)
+    await state.set_state(ReceiptStates.picking_user)
+
+    buttons = [
+        [InlineKeyboardButton(text=full_name, callback_data=f"recvpick:{i}")]
+        for i, (user_id, full_name) in enumerate(users)
+    ]
+    buttons.append([InlineKeyboardButton(text="👥 Hammasi", callback_data="recvpick:all")])
+    await message.answer(
+        f"🧾 {title}\n\nKimning cheklarini ko'rmoqchisiz?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@dp.callback_query(ReceiptStates.picking_user, F.data.startswith("recvpick:"))
+async def recvpick(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    target_chat_id = data["chat_id"]
+    title = data["title"]
+    start = date.fromisoformat(data["start"]) if data.get("start") else None
+    end = date.fromisoformat(data["end"]) if data.get("end") else None
+
+    choice = call.data.split(":", 1)[1]
+
+    if choice == "all":
+        rows = await fetch_receipts(target_chat_id, None, start, end)
+        text = format_receipts(f"{title} — hammasi", rows)
+    else:
+        user_id = data["user_map"].get(choice)
+        rows = await fetch_receipts(target_chat_id, user_id, start, end)
+        full_name = rows[0][0] if rows else ""
+        text = format_receipts(f"{title} — {full_name}", rows)
+
+    await call.message.edit_text(text)
+    await call.answer()
+    await state.clear()
+
+
 @dp.callback_query(F.data.startswith("rep_range:"))
 async def rep_range(call: CallbackQuery, state: FSMContext):
     target_chat_id = int(call.data.split(":", 1)[1])
@@ -397,17 +663,33 @@ async def got_end_date(message: Message, state: FSMContext):
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def catch_group_message(message: Message):
-    """Guruhdagi oddiy xabarlarni tekshirib, summa bo'lsa saqlaydi."""
+    """Guruhdagi oddiy xabarlarni tekshirib, summa yoki chek/izoh bo'lsa saqlaydi."""
     if message.chat.type not in ("group", "supergroup"):
         return  # shaxsiy chatdagi oddiy matnlarni e'tiborsiz qoldiramiz
-
-    amount = parse_amount(message.text)
-    if amount is None:
-        return
 
     user = message.from_user
     is_admin = user.id in ADMIN_IDS
     full_name = user.full_name or (user.username or str(user.id))
+
+    # Admin (chek tashlovchi) emas, faqat oddiy xodimlarning "chek"
+    # so'zi bilan yozgan xabarlari (masalan "chek yo'q berdi") alohida
+    # chek/izoh sifatida saqlanadi — summa sifatida hisoblanmaydi.
+    if not is_admin and "chek" in message.text.lower():
+        await save_receipt(
+            chat_id=message.chat.id,
+            user_id=user.id,
+            full_name=full_name,
+            username=user.username,
+            has_photo=False,
+            file_id=None,
+            caption=message.text,
+        )
+        log.info("Chek izohi saqlandi: %s -> %s", full_name, message.text)
+        return
+
+    amount = parse_amount(message.text)
+    if amount is None:
+        return
 
     await save_request(
         chat_id=message.chat.id,
@@ -419,6 +701,31 @@ async def catch_group_message(message: Message):
         is_admin=is_admin,
     )
     log.info("Saqlandi: %s -> %s so'm (%s)", full_name, amount, message.text)
+
+
+@dp.message(F.photo)
+async def catch_group_photo(message: Message):
+    """Guruhda xodim (admin emas) tashlagan chek rasmini saqlaydi."""
+    if message.chat.type not in ("group", "supergroup"):
+        return
+
+    user = message.from_user
+    if user.id in ADMIN_IDS:
+        return  # admin/egasi tashlagan chek rasmlari hisobga qo'shilmaydi
+
+    full_name = user.full_name or (user.username or str(user.id))
+    largest_photo = message.photo[-1]
+
+    await save_receipt(
+        chat_id=message.chat.id,
+        user_id=user.id,
+        full_name=full_name,
+        username=user.username,
+        has_photo=True,
+        file_id=largest_photo.file_id,
+        caption=message.caption,
+    )
+    log.info("Chek rasmi saqlandi: %s", full_name)
 
 
 async def health(request):
