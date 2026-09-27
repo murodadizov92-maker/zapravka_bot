@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import re
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
 import aiosqlite
 from aiohttp import web
@@ -39,6 +39,30 @@ GROUP_CHAT_ID = int(GROUP_CHAT_ID) if GROUP_CHAT_ID and GROUP_CHAT_ID.lstrip("-"
 
 DB_PATH = os.getenv("GAZ_BOT_DB", "gaz_rasxod.db")
 
+# Server (Render) UTC vaqtida ishlaydi, lekin bizga Toshkent vaqti (UTC+5)
+# kerak — Sana/vaqt saqlash va "bugun/kecha/bu oy" filtrlari shu bo'yicha
+# hisoblanadi. O'zbekiston yozgi vaqtga o'tmaydi, shuning uchun doimiy +5
+# offset yetarli (IANA tzdata'ga bog'liq bo'lmaslik uchun ham shunday).
+TASHKENT_TZ = timezone(timedelta(hours=5))
+
+
+def now_local() -> datetime:
+    return datetime.now(TASHKENT_TZ)
+
+
+def today_local() -> date:
+    return now_local().date()
+
+
+def local_timestamp() -> str:
+    """Bazaga saqlash uchun: Toshkent vaqti, lekin OFFSETSIZ (masalan
+    '2026-09-27T13:26:00'). SQLite'ning date()/BETWEEN funksiyalari
+    '+05:00' kabi belgini ko'rib, uni avtomatik UTC'ga aylantirib
+    yuboradi — bu bizga kerak emas, shuning uchun offsetni olib
+    tashlab, "xom" mahalliy vaqt sifatida saqlaymiz."""
+    return now_local().replace(tzinfo=None).isoformat()
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("gaz-bot")
 
@@ -57,6 +81,17 @@ WORD_MULT = {
 
 DATE_LIKE_RE = re.compile(r"\d{1,2}[./]\d{1,2}[./]\d{2,4}")
 NUMBER_RE = re.compile(r"(\d[\d\s.,]{0,12}\d|\d)")
+
+# Karta raqamiga o'xshagan uzun raqam ketma-ketliklarini (bo'shliq/tire bilan
+# yozilgan bo'lsa ham) topib, bazaga saqlashdan oldin yashirish uchun.
+CARD_NUMBER_RE = re.compile(r"(?:\d[ \-]?){12,}\d")
+
+
+def mask_card_numbers(text: str) -> str:
+    """Xavfsizlik uchun: matndagi karta raqamiga o'xshagan uzun raqamlarni
+    (12+ ketma-ket raqam) '[karta raqami yashirildi]' bilan almashtiradi,
+    shunda u bazaga hech qachon to'liq holda saqlanmaydi."""
+    return CARD_NUMBER_RE.sub("[karta raqami yashirildi]", text)
 
 
 def parse_amount(text: str) -> int | None:
@@ -142,7 +177,7 @@ async def save_receipt(chat_id: int, user_id: int, full_name: str,
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (chat_id, user_id, full_name, username, int(has_photo),
-             file_id, caption, datetime.now().isoformat()),
+             file_id, caption, local_timestamp()),
         )
         await db.commit()
 
@@ -208,7 +243,7 @@ async def save_request(chat_id: int, user_id: int, full_name: str,
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (chat_id, user_id, full_name, username, amount, raw_text,
-             int(is_admin), datetime.now().isoformat()),
+             int(is_admin), local_timestamp()),
         )
         await db.commit()
 
@@ -462,7 +497,7 @@ async def cb_delete(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("rep_today:"))
 async def rep_today(call: CallbackQuery):
     target_chat_id = int(call.data.split(":", 1)[1])
-    today = date.today()
+    today = today_local()
     rows = await fetch_report(target_chat_id, today, today)
     await call.message.edit_text(format_report(f"Hisobot: bugun ({today:%d.%m.%Y})", rows))
     await call.answer()
@@ -471,7 +506,7 @@ async def rep_today(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("rep_yesterday:"))
 async def rep_yesterday(call: CallbackQuery):
     target_chat_id = int(call.data.split(":", 1)[1])
-    y = date.today() - timedelta(days=1)
+    y = today_local() - timedelta(days=1)
     rows = await fetch_report(target_chat_id, y, y)
     await call.message.edit_text(format_report(f"Hisobot: kecha ({y:%d.%m.%Y})", rows))
     await call.answer()
@@ -480,7 +515,7 @@ async def rep_yesterday(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("rep_month:"))
 async def rep_month(call: CallbackQuery):
     target_chat_id = int(call.data.split(":", 1)[1])
-    today = date.today()
+    today = today_local()
     start = today.replace(day=1)
     rows = await fetch_report(target_chat_id, start, today)
     title = f"Hisobot: bu oy ({start:%d.%m.%Y} - {today:%d.%m.%Y})"
@@ -550,7 +585,7 @@ async def _show_receipt_users(message: Message, state: FSMContext,
 async def recvp_period(call: CallbackQuery, state: FSMContext):
     _, period, target_chat_id = call.data.split(":")
     target_chat_id = int(target_chat_id)
-    today = date.today()
+    today = today_local()
 
     if period == "today":
         await _show_receipt_users(call.message, state, target_chat_id, today, today,
@@ -724,10 +759,20 @@ async def catch_group_message(message: Message):
     is_admin = user.id in ADMIN_IDS
     full_name = user.full_name or (user.username or str(user.id))
 
-    # Admin (chek tashlovchi) emas, faqat oddiy xodimlarning "chek"
-    # so'zi bilan yozgan xabarlari (masalan "chek yo'q berdi") alohida
-    # chek/izoh sifatida saqlanadi — summa sifatida hisoblanmaydi.
-    if not is_admin and "chek" in message.text.lower():
+    # Admin (chek tashlovchi) emas, faqat oddiy xodimlarning "chek/karta/qr"
+    # so'zi bilan yozgan xabarlari (masalan "chek yo'q berdi", "karta orqali
+    # to'ladim", "QR to'lov qildim") alohida chek/izoh sifatida saqlanadi —
+    # summa sifatida (yangi so'rov deb) hisoblanmaydi.
+    RECEIPT_KEYWORDS = ("chek", "karta", "qr")
+    text_lower = message.text.lower()
+    has_keyword = any(kw in text_lower for kw in RECEIPT_KEYWORDS)
+    # Faqat karta raqami (12+ ketma-ket raqam) bo'lgan, hech qanday kalit
+    # so'zsiz xabar — bu faqat pul o'tkazish uchun karta raqami, hisobotga
+    # umuman aloqasi yo'q, shuning uchun hech qayerga saqlanmaydi.
+    has_card_number = len(re.sub(r"\D", "", message.text)) >= 12
+
+    if not is_admin and has_keyword:
+        safe_text = mask_card_numbers(message.text)
         await save_receipt(
             chat_id=message.chat.id,
             user_id=user.id,
@@ -735,9 +780,14 @@ async def catch_group_message(message: Message):
             username=user.username,
             has_photo=False,
             file_id=None,
-            caption=message.text,
+            caption=safe_text,
         )
-        log.info("Chek izohi saqlandi: %s -> %s", full_name, message.text)
+        log.info("Chek izohi saqlandi: %s -> %s", full_name, safe_text)
+        return
+
+    if not is_admin and has_card_number:
+        # Faqat karta raqami — hech narsa saqlanmaydi, e'tiborsiz qoldiriladi
+        log.info("Karta raqami xabari e'tiborsiz qoldirildi: %s", full_name)
         return
 
     amount = parse_amount(message.text)
@@ -768,6 +818,7 @@ async def catch_group_photo(message: Message):
 
     full_name = user.full_name or (user.username or str(user.id))
     largest_photo = message.photo[-1]
+    safe_caption = mask_card_numbers(message.caption) if message.caption else None
 
     await save_receipt(
         chat_id=message.chat.id,
@@ -776,7 +827,7 @@ async def catch_group_photo(message: Message):
         username=user.username,
         has_photo=True,
         file_id=largest_photo.file_id,
-        caption=message.caption,
+        caption=safe_caption,
     )
     log.info("Chek rasmi saqlandi: %s", full_name)
 
