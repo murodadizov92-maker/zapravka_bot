@@ -5,6 +5,8 @@ import re
 from datetime import datetime, date, timedelta, timezone
 
 import aiosqlite
+import cv2
+import numpy as np
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -158,28 +160,93 @@ async def init_db():
                 username TEXT,
                 has_photo INTEGER NOT NULL DEFAULT 0,
                 file_id TEXT,
+                file_unique_id TEXT,
+                qr_data TEXT,
                 caption TEXT,
                 created_at TEXT NOT NULL
             )
             """
         )
+        # Eski (avval yaratilgan) bazalarda file_unique_id/qr_data ustuni
+        # bo'lmasligi mumkin — mavjud bo'lmasa qo'shib qo'yamiz (xato
+        # chiqsa, demak allaqachon bor, e'tiborsiz qoldiramiz).
+        for column_sql in (
+            "ALTER TABLE receipts ADD COLUMN file_unique_id TEXT",
+            "ALTER TABLE receipts ADD COLUMN qr_data TEXT",
+        ):
+            try:
+                await db.execute(column_sql)
+            except Exception:
+                pass
         await db.commit()
 
 
 async def save_receipt(chat_id: int, user_id: int, full_name: str,
                         username: str | None, has_photo: bool,
-                        file_id: str | None, caption: str | None):
+                        file_id: str | None, caption: str | None,
+                        file_unique_id: str | None = None,
+                        qr_data: str | None = None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
             INSERT INTO receipts (chat_id, user_id, full_name, username,
-                                   has_photo, file_id, caption, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                   has_photo, file_id, file_unique_id,
+                                   qr_data, caption, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (chat_id, user_id, full_name, username, int(has_photo),
-             file_id, caption, local_timestamp()),
+             file_id, file_unique_id, qr_data, caption, local_timestamp()),
         )
         await db.commit()
+
+
+async def find_duplicate_receipt(chat_id: int, file_unique_id: str) -> tuple | None:
+    """Xuddi shu rasm (bir xil file_unique_id) avval yuborilganmi —
+    yuborilgan bo'lsa, birinchi marta kim/qachon yuborganini qaytaradi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT full_name, created_at FROM receipts
+            WHERE chat_id = ? AND file_unique_id = ?
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (chat_id, file_unique_id),
+        )
+        return await cursor.fetchone()
+
+
+async def find_duplicate_qr(chat_id: int, qr_data: str) -> tuple | None:
+    """Xuddi shu QR kod (bir xil tranzaksiya) avval yuborilganmi — hatto
+    rasm boshqacha (qayta suratga olingan) bo'lsa ham aniqlaydi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT full_name, created_at FROM receipts
+            WHERE chat_id = ? AND qr_data = ? AND qr_data IS NOT NULL AND qr_data != ''
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (chat_id, qr_data),
+        )
+        return await cursor.fetchone()
+
+
+def decode_qr(image_bytes: bytes) -> str | None:
+    """Rasm baytlaridan QR kodni o'qishga harakat qiladi. Topilmasa yoki
+    xato bo'lsa None qaytaradi (rasm QR kodsiz oddiy chek bo'lishi ham
+    mumkin — bu xato emas)."""
+    try:
+        arr = np.frombuffer(image_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        detector = cv2.QRCodeDetector()
+        data, points, _ = detector.detectAndDecode(img)
+        return data if data else None
+    except Exception:
+        log.exception("QR o'qishda xatolik")
+        return None
 
 
 async def fetch_receipt_users(chat_id: int, start: date | None = None,
@@ -820,6 +887,26 @@ async def catch_group_photo(message: Message):
     largest_photo = message.photo[-1]
     safe_caption = mask_card_numbers(message.caption) if message.caption else None
 
+    # Xuddi shu rasm fayli (bir xil file_unique_id) avval yuborilganmi —
+    # bu ASOSIY aldov tekshiruvi (eski skrinshotni qayta yuborish), doim
+    # ishlaydi.
+    duplicate = await find_duplicate_receipt(message.chat.id, largest_photo.file_unique_id)
+
+    # Har bir rasmda QR skanerlashga harakat qilamiz. Haqiqiy xarid cheki
+    # (Click/Payme/karta) da odatda QR bo'ladi — topilsa, shuni tekshiramiz.
+    # Kolonka/displey rasmida QR bo'lmaydi — topilmasa, oddiy tasdiq
+    # sifatida (tekshirmasdan) saqlaymiz.
+    qr_data = None
+    qr_duplicate = None
+    try:
+        file = await bot.get_file(largest_photo.file_id)
+        file_bytes_io = await bot.download_file(file.file_path)
+        qr_data = decode_qr(file_bytes_io.read())
+        if qr_data:
+            qr_duplicate = await find_duplicate_qr(message.chat.id, qr_data)
+    except Exception:
+        log.exception("Chek rasmini yuklab QR o'qishda xatolik")
+
     await save_receipt(
         chat_id=message.chat.id,
         user_id=user.id,
@@ -827,9 +914,43 @@ async def catch_group_photo(message: Message):
         username=user.username,
         has_photo=True,
         file_id=largest_photo.file_id,
+        file_unique_id=largest_photo.file_unique_id,
+        qr_data=qr_data,
         caption=safe_caption,
     )
-    log.info("Chek rasmi saqlandi: %s", full_name)
+    log.info("Chek rasmi saqlandi: %s (QR topildimi: %s)", full_name, bool(qr_data))
+
+    def fmt_ts(raw: str) -> str:
+        try:
+            return datetime.fromisoformat(raw).strftime("%d.%m.%Y %H:%M")
+        except ValueError:
+            return raw
+
+    if qr_duplicate:
+        prev_name, prev_created_at = qr_duplicate
+        await message.reply(
+            f"⚠️ Diqqat! Bu chekdagi QR/tranzaksiya avval ham yuborilgan "
+            f"edi ({prev_name}, {fmt_ts(prev_created_at)}) — rasm boshqacha "
+            f"bo'lsa ham, bu bir xil to'lov. ESKI chek qayta yuborilyapti — "
+            f"tekshirib ko'ring."
+        )
+    elif duplicate:
+        prev_name, prev_created_at = duplicate
+        await message.reply(
+            f"⚠️ Diqqat! Bu chek rasmi avval ham yuborilgan edi "
+            f"({prev_name}, {fmt_ts(prev_created_at)}). Bu ESKI chek qayta "
+            f"yuborilyapti, YANGI chek emas — tekshirib ko'ring."
+        )
+    elif not qr_data:
+        # QR topilmadi — demak bu, ehtimol, xarid cheki emas (masalan
+        # kolonka displeyi rasmi). Xodimni xushmuomalalik bilan xarid
+        # chekini ham so'rab olishga undaymiz.
+        mention = f'<a href="tg://user?id={user.id}">{full_name}</a>'
+        await message.answer(
+            f"💬 {mention}, iltimos imkon bo'lsa xarid chekini ham so'rab "
+            f"oling — bu sizning huquqingiz!",
+            parse_mode="HTML",
+        )
 
 
 async def health(request):
